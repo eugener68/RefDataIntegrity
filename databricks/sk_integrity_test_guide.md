@@ -26,9 +26,13 @@ Run these notebooks **first** (in order):
 |---|---|
 | `00_setup_trial.py` | `customer_dim`, `transaction_fact`, `customer_scd2` |
 | `02_setup_bridge_test.py` | `product_dim` |
-| `03_setup_ambiguous_cols_test.py` | *(optional)* `account_dim`, `account_key` on facts |
+| `10_setup_sk_integrity_test_env.py` | Broken gold, `account_dim`, `account_key` on facts, hub, all SK scenarios |
 
-Then run **`10_setup_sk_integrity_test_env.py`** (`recreate=true` to reset gold).
+**SK path:** `00` → `02` → `10` → `11` — **no `03` required.**
+
+**Existing recon DB** (after `01`/`04`): run **`10`** + **`11`** only.
+
+**Recon + SK:** `00` → `01` → `02` → `04` → `10` → `11` — skip `03` unless testing recon table aliases.
 
 ---
 
@@ -51,8 +55,8 @@ Repair notebook widgets map these to `legacy_valid_from` / `legacy_valid_to` (an
 | `customer_dim` | 1,000 | NK = `customer_id`, SK = `customer_key` |
 | `product_dim` | 50 | NK = `product_code` (+ `source_system='ERP'` added at setup) |
 | `customer_scd2` | 1,000 | SCD2: `effectiveStartDate`, `effectiveEndDate`, `recordStatus` |
-| `account_dim` | 20 | *(optional)* NK = `account_id` |
-| `transaction_fact` | 1,000 | FKs: `customer_key`, `product_key`, [`account_key`] |
+| `account_dim` | 121 | SK fixture (120 + unknown); NK = `account_id` (`AID0001`…) — **written by `10_setup`** |
+| `transaction_fact` | 1,000 | FKs: `customer_key`, `product_key`, **`account_key`** |
 | `return_fact` | **new** ~200 | FKs: `customer_key`, `product_key` |
 | `scd2_activity_fact` | **new** ~400 | FK: `surrogate_key` → SCD2 customer dim |
 | **`account_details_scd2`** | **new** ~240 | **SCD2 hub** — 7 FKs → 7 separate lookup dims |
@@ -108,7 +112,7 @@ Each pass leaves **other FK columns unchanged** — only the column for the dime
 | `customer_dim` | `recon_src.sales.customer_dim` | Regenerated SKs; 30 ORPHAN_OLD, 15 ORPHAN_NEW |
 | `product_dim` | `product_dim` | Regenerated SKs (reverse-sorted NK) |
 | `customer_scd2` | `customer_scd2` | Regenerated SKs; validity +15 days → `AMBIGUOUS` |
-| `account_dim` | `account_dim` | *(optional)* Regenerated SKs |
+| `account_dim` | `account_dim` | Regenerated SKs (from §1b fixture) |
 | `transaction_fact` | `transaction_fact` | Mixed `load_batch` cohorts |
 | `return_fact` | `return_fact` | Mixed cohorts |
 | `scd2_activity_fact` | `scd2_activity_fact` | All `INITIAL_SS` |
@@ -195,7 +199,9 @@ Each pass leaves **other FK columns unchanged** — only the column for the dime
 | `fact_tables` | `recon_tgt.gold.scd2_activity_fact:surrogate_key` |
 | `fact_event_date_cols` | `event_date` |
 
-### Test 4: `account_dim` *(requires notebook 03 or hub-created dim)*
+### Test 4: `account_dim` → fact + hub (third FK — TC-REPAIR-SCD1-004)
+
+Provided by `10_setup` §1b. NK = `account_id` (string codes `AID0001`…, not notebook `01`/`03` formats).
 
 | Widget | Value |
 |---|---|
@@ -205,6 +211,7 @@ Each pass leaves **other FK columns unchanged** — only the column for the dime
 | `new_dim_table` | `account_dim` |
 | `new_sk_col` | `account_key` |
 | `new_nk_cols` | `account_id` |
+| `scd_type` | `1` |
 | `fact_tables` | `recon_tgt.gold.transaction_fact:account_key,recon_tgt.gold.account_details_scd2:account_key` |
 
 ---
@@ -269,13 +276,12 @@ Same as Test 5 but product widgets; `legacy_fact_fk_cols` = `product_key,product
 ## Recommended sequence
 
 ```
-00_setup_trial.py  →  02_setup_bridge_test.py  →  [03 optional]
-        →  10_setup_sk_integrity_test_env.py
-        →  repair/alignment notebook (dry_run=true)
-        →  dry_run=false, validate, manual swap
+00 → 02 → 10 (recreate=true) → 11 (phase=setup)
+  → repair/alignment notebook (dry_run=true) → dry_run=false → swap
+  → 11 (phase=post_repair)
 ```
 
-Re-run setup with `recreate=true` to restore the broken baseline between test cycles.
+Re-run `10` with `recreate=true` to reset the broken baseline between test cycles.
 
 ---
 

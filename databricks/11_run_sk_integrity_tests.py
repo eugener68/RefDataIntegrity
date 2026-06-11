@@ -57,7 +57,7 @@ if PHASE == "setup":
     required_tgt = [
         "customer_dim", "product_dim", "customer_scd2", "transaction_fact",
         "return_fact", "scd2_activity_fact", "account_details_scd2",
-        "account_type_scd2", "market_dim", "sk_test_scenario_manifest",
+        "account_type_scd2", "market_dim", "account_dim", "sk_test_scenario_manifest",
     ]
 
     for tbl in required_src:
@@ -100,6 +100,17 @@ if PHASE == "setup":
     """).first()["c"]
     _check("TC-DATA-003", "Pre-repair hub market orphans", hub_orphans > 0, f"{hub_orphans:,}")
 
+    tx_cols = spark.table(f"{SRC}.transaction_fact").columns
+    _check("TC-REPAIR-SCD1-004", "transaction_fact.account_key column", "account_key" in tx_cols)
+    acct_n = _count(f"{SRC}.account_dim")
+    _check("TC-REPAIR-SCD1-004", "account_dim SK fixture", acct_n >= 120, f"{acct_n} rows")
+    orphans_acct = spark.sql(f"""
+        SELECT COUNT(*) c FROM {TGT}.transaction_fact f
+        LEFT ANTI JOIN {TGT}.account_dim d ON f.account_key = d.account_key
+        WHERE f.account_key <> -1
+    """).first()["c"]
+    _check("TC-REPAIR-SCD1-004", "Pre-repair account_key orphans", orphans_acct > 0, f"{orphans_acct:,}")
+
     if "activity_cohort" in spark.table(f"{SRC}.scd2_activity_fact").columns:
         hist_n = spark.table(f"{SRC}.scd2_activity_fact").filter("activity_cohort = 'HISTORIC'").count()
         cur_n = spark.table(f"{SRC}.scd2_activity_fact").filter("activity_cohort = 'CURRENT'").count()
@@ -140,6 +151,7 @@ if PHASE == "post_repair":
         (f"{TGT}.transaction_fact", f"{TGT}.transaction_fact_fixed", "customer_key", f"{TGT}.customer_dim", "customer_key"),
         (f"{TGT}.return_fact", f"{TGT}.return_fact_fixed", "customer_key", f"{TGT}.customer_dim", "customer_key"),
         (f"{TGT}.scd2_activity_fact", f"{TGT}.scd2_activity_fact_fixed", "surrogate_key", f"{TGT}.customer_scd2", "surrogate_key"),
+        (f"{TGT}.transaction_fact", f"{TGT}.transaction_fact_fixed", "account_key", f"{TGT}.account_dim", "account_key"),
         (f"{TGT}.account_details_scd2", f"{TGT}.account_details_scd2_fixed", "market_key", f"{TGT}.market_dim", "market_key"),
     ]
     any_fixed = False

@@ -10,7 +10,7 @@ This document defines **automated and manual test cases** for the surrogate-key 
 
 | Step | Action |
 |---|---|
-| 1 | Run prerequisites: `00_setup_trial.py`, `02_setup_bridge_test.py`, optional `03_setup_ambiguous_cols_test.py` |
+| 1 | Run **`00_setup_trial.py`**, **`02_setup_bridge_test.py`**, then **`10_setup_sk_integrity_test_env.py`** (`recreate=true`) |
 | 2 | Run `10_setup_sk_integrity_test_env.py` with `recreate=true` |
 | 3 | Run `11_run_sk_integrity_tests.py` — validates setup (Phase 1) |
 | 4 | Run repair/alignment notebooks per case (Phase 2 — manual or job) |
@@ -31,6 +31,7 @@ Scenario registry table: `recon_tgt.gold.sk_test_scenario_manifest`
 | TC-REPAIR-SCD1-001 | Repair | SCD1, single fact | `customer_dim` → `transaction_fact` |
 | TC-REPAIR-SCD1-002 | Repair | SCD1, multiple facts | `customer_dim` → two facts |
 | TC-REPAIR-SCD1-003 | Repair | SCD1 composite NK | `product_dim` → two facts |
+| TC-REPAIR-SCD1-004 | Repair | SCD1 third FK | `account_dim` → `transaction_fact.account_key` |
 | TC-REPAIR-SCD2-001 | Repair | SCD2 current facts | `customer_scd2` → activity (CURRENT) |
 | TC-REPAIR-SCD2-002 | Repair | SCD2 historic facts | activity (HISTORIC cohort) |
 | TC-REPAIR-SCD2-003 | Repair | SCD2 AMBIGUOUS | `customer_scd2` +15d validity shift |
@@ -112,6 +113,20 @@ fact_tables = recon_tgt.gold.transaction_fact:customer_key,recon_tgt.gold.return
 ```
 
 **Expected:** Both `*_fixed` tables pass post checks in one run.
+
+---
+
+### TC-REPAIR-SCD1-004 — Third FK on transaction_fact
+
+**Provided by:** `10_setup` §1b (replaces notebook `03` for SK tests).
+
+**Data:**
+- `recon_src.sales.account_dim` — 121 rows (120 + unknown), NK = `account_id` (`AID0001`…)
+- `transaction_fact.account_key` always populated on golden and broken copies
+
+**Widgets:** See sk_integrity_test_guide Test 4.
+
+**Expected post-repair:** Zero orphans on `transaction_fact.account_key` and hub `account_key`.
 
 ---
 

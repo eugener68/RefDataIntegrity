@@ -15,18 +15,16 @@
 # MAGIC 1. `00_setup_trial.py` — customer_dim, transaction_fact, customer_scd2
 # MAGIC 2. `02_setup_bridge_test.py` — product_dim
 # MAGIC
-# MAGIC **Not required for SK tests:** `03_setup_ambiguous_cols_test.py` (recon-only). This notebook
-# MAGIC adds `account_key` on `transaction_fact` and writes the SK-test `account_dim` itself.
+# MAGIC **Not required:** `03_setup_ambiguous_cols_test.py` (recon-only). This notebook creates
+# MAGIC `account_dim` + `transaction_fact.account_key` itself (TC-REPAIR-SCD1-004 third FK).
 # MAGIC
-# MAGIC **Compatible with existing recon setup:** safe to run after `01` / `04` on a catalog that already
-# MAGIC ran recon notebooks. Overwrites **`recon_src.sales.account_dim`** (120-row SK fixture) and
-# MAGIC refreshes **`recon_src.sales.transaction_fact.account_key`**. Does **not** modify `recon_tgt.silver`.
+# MAGIC **Compatible with:** existing DB after `01`/`04` (recon) — overwrites `recon_src.sales.account_dim`
+# MAGIC and patches golden `transaction_fact`; does **not** touch `recon_tgt.silver`.
 # MAGIC
-# MAGIC ### Golden tables used / updated in `recon_src.sales`
-# MAGIC - **Read:** `customer_dim`, `product_dim`, `customer_scd2`
-# MAGIC - **Written/updated:** `account_dim`, `transaction_fact` (+ `return_fact`, hub, lookup dims, …)
-# MAGIC - **New:** `return_fact`, `scd2_activity_fact`, **`account_details_scd2`**, lookup dims, **`account_type_scd2`**
-# MAGIC - **`sk_test_scenario_manifest`** — catalog of test scenarios (for automated tests)
+# MAGIC ### Golden tables written/updated in `recon_src.sales`
+# MAGIC - `account_dim` — SK test fixture (120 rows, NK `account_id`)
+# MAGIC - `transaction_fact` — adds/replaces `account_key` (third FK)
+# MAGIC - **New:** `return_fact`, `scd2_activity_fact`, hub, lookup dims, `account_type_scd2`
 # MAGIC
 # MAGIC ### Broken tables created (`recon_tgt.gold`)
 # MAGIC **Dimensions:** `customer_dim`, `product_dim`, `customer_scd2`, lookup dims (`subscriber_dim`, `market_dim`, …)
@@ -42,6 +40,7 @@
 # MAGIC |---|---|
 # MAGIC | TC-REPAIR-SCD1-001/002 | SCD1 dim → one or two facts |
 # MAGIC | TC-REPAIR-SCD1-003 | Composite NK (`product_dim`) |
+# MAGIC | TC-REPAIR-SCD1-004 | Third FK — `account_dim` → `transaction_fact.account_key` |
 # MAGIC | TC-REPAIR-SCD2-001/002 | SCD2 dim → fact (current + **historic** activity rows) |
 # MAGIC | TC-REPAIR-HUB-001 | Hub → SCD1 lookup FK (`market_key`) |
 # MAGIC | TC-REPAIR-HUB-002 | Hub → **SCD2 lookup** FK (`account_type_key` → `account_type_scd2`) |
@@ -78,12 +77,6 @@ for tbl in REQUIRED:
     except Exception as exc:
         raise RuntimeError(f"Missing {tbl} — run 00_setup_trial.py and 02_setup_bridge_test.py first.\n{exc}")
 
-if spark.catalog.tableExists(f"{SRC}.account_dim"):
-    n = spark.table(f"{SRC}.account_dim").count()
-    print(f"  ℹ {SRC}.account_dim exists ({n:,} rows) — will be replaced with SK-test fixture")
-else:
-    print(f"  ℹ {SRC}.account_dim not found — will be created")
-
 spark.sql("CREATE SCHEMA IF NOT EXISTS recon_tgt.gold")
 spark.sql("CREATE SCHEMA IF NOT EXISTS recon_tgt.staging")
 spark.sql("CREATE SCHEMA IF NOT EXISTS recon_tgt.keymap")
@@ -108,7 +101,7 @@ _rng = np.random.default_rng(SEED)
 ORPHAN_OLD_COUNT = 30
 ORPHAN_NEW_COUNT = 15
 INCREMENTAL_PCT  = 0.35
-N_ACCOUNTS_SK    = 120     # SK-test account_dim row count (replaces 01/03 golden account_dim)
+N_ACCOUNTS         = 120   # account_dim rows + transaction_fact.account_key range
 TODAY = date.today()
 D_MINUS_1 = TODAY - timedelta(days=1)
 
@@ -126,6 +119,18 @@ def _to_date(val):
     return pd.Timestamp(val).date()
 
 
+def _lookup_dim(name, sk_col, nk_col, n, code_prefix):
+    """Small SCD1 reference dim with unknown member."""
+    codes = [f"{code_prefix}{str(i).zfill(4)}" for i in range(1, n + 1)]
+    df = pd.DataFrame({
+        sk_col:  np.arange(1, n + 1, dtype="int64"),
+        nk_col:  codes,
+        f"{name}_name": [f"{name.title()} {c}" for c in codes],
+    })
+    unknown = pd.DataFrame({sk_col: [-1], nk_col: ["UNKNOWN"], f"{name}_name": ["Unknown"]})
+    return pd.concat([unknown, df], ignore_index=True)
+
+
 print(f"Reference dates: D-1={D_MINUS_1}, today={TODAY}")
 
 # COMMAND ----------
@@ -138,7 +143,6 @@ print(f"Reference dates: D-1={D_MINUS_1}, today={TODAY}")
 cust_ss = spark.table(f"{SRC}.customer_dim").toPandas()
 prod_ss = spark.table(f"{SRC}.product_dim").toPandas()
 scd2_ss = spark.table(f"{SRC}.customer_scd2").toPandas()
-acct_ss = spark.table(f"{SRC}.account_dim").toPandas() if has_account else None
 
 # Add source_system for composite-NK product tests (constant on all rows)
 prod_ss["source_system"] = "ERP"
@@ -156,11 +160,21 @@ print(f"Golden dims: customer={len(cust_ss):,}, product={len(prod_ss):,}, scd2={
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 2. Create golden facts in `recon_src.sales` (return + SCD2 activity)
+# MAGIC ## 1b. Golden `account_dim` + third FK on `transaction_fact`
+# MAGIC
+# MAGIC Replaces any `account_dim` from recon notebooks `01`/`03` in **`recon_src` only**.
+# MAGIC Adds `account_key` to golden `transaction_fact` (replaces 03 for SK tests).
 
 # COMMAND ----------
 
+acct_ss = _lookup_dim("account", "account_key", "account_id", N_ACCOUNTS, "AID")
+_write(acct_ss, f"{SRC}.account_dim")
+valid_acct_keys = acct_ss[acct_ss["account_key"] > 0]["account_key"].values
+
 tx_ss = spark.table(f"{SRC}.transaction_fact").toPandas()
+tx_ss["account_key"] = _rng.choice(valid_acct_keys, size=len(tx_ss)).astype("int64")
+_write(tx_ss, f"{SRC}.transaction_fact")
+print(f"transaction_fact: added account_key (third FK), {len(tx_ss):,} rows")
 n_tx = len(tx_ss)
 n_ret = max(200, n_tx // 5)
 ret_ss = pd.DataFrame({
@@ -211,7 +225,7 @@ scd2_fact_ss = pd.concat([cur_facts, hist_facts], ignore_index=True)
 
 _write(ret_ss,       f"{SRC}.return_fact")
 _write(scd2_fact_ss, f"{SRC}.scd2_activity_fact")
-print("Golden facts return_fact + scd2_activity_fact written (recon_src.sales.transaction_fact unchanged).")
+print("Golden facts return_fact + scd2_activity_fact written.")
 
 # COMMAND ----------
 
@@ -234,7 +248,7 @@ N_MARKETS          = 20
 N_AUTOPAY          = 8
 N_BILLING_PRODUCTS = 40
 N_PAYMENT_METHODS  = 15
-N_ACCOUNT_BK       = 120    # distinct account_number natural keys
+N_ACCOUNT_BK       = N_ACCOUNTS
 N_DETAIL_VERSIONS  = 2      # SCD2 versions per account (avg)
 
 def _break_scd1_dim(golden, sk_col, nk_col, sort_cols=None):
@@ -290,17 +304,6 @@ def _scd2_lookup_dim(name, sk_col, nk_col, codes, versions_per_code=2):
     })
     return pd.concat([unknown, df], ignore_index=True)
 
-def _lookup_dim(name, sk_col, nk_col, n, code_prefix):
-    """Small SCD1 reference dim with unknown member."""
-    codes = [f"{code_prefix}{str(i).zfill(4)}" for i in range(1, n + 1)]
-    df = pd.DataFrame({
-        sk_col:  np.arange(1, n + 1, dtype="int64"),
-        nk_col:  codes,
-        f"{name}_name": [f"{name.title()} {c}" for c in codes],
-    })
-    unknown = pd.DataFrame({sk_col: [-1], nk_col: ["UNKNOWN"], f"{name}_name": ["Unknown"]})
-    return pd.concat([unknown, df], ignore_index=True)
-
 
 subscriber_ss = _lookup_dim("subscriber", "subscriber_key", "subscriber_id", N_SUBSCRIBERS, "SUB")
 account_type_ss = _lookup_dim("account_type", "account_type_key", "account_type_code", N_ACCOUNT_TYPES, "AT")
@@ -330,11 +333,6 @@ at_keys_current = account_type_scd2_ss[account_type_scd2_ss["recordStatus"] == "
 at_keys_hist    = account_type_scd2_ss[account_type_scd2_ss["recordStatus"] == "H"]["account_type_key"].values
 
 # ── account_details_scd2: SCD2 hub with FKs to separate lookup dims ───────────
-if not has_account:
-    acct_ss = _lookup_dim("account", "account_key", "account_id", N_ACCOUNT_BK, "AID")
-    _write(acct_ss, f"{SRC}.account_dim")
-    has_account = True
-
 account_numbers = [f"ACC{str(i).zfill(6)}" for i in range(1, N_ACCOUNT_BK + 1)]
 valid_acct_keys = acct_ss[acct_ss["account_key"] > 0]["account_key"].values
 detail_rows = []
@@ -434,13 +432,12 @@ scd2_db, scd2_old_to_new = _break_scd2_dim(
     scd2_ss, "surrogate_key", "customer_id", "effectiveStartDate", "effectiveEndDate", shift_days=15,
 )
 
-# Account dim (optional)
-if has_account:
-    acct_db, acct_old_to_new = _break_scd1_dim(acct_ss, "account_key", "account_id")
-    acct_nk_to_db = {
-        r["account_id"]: acct_old_to_new.get(int(r["account_key"]), -1)
-        for _, r in acct_ss[acct_ss["account_key"] > 0].iterrows()
-    }
+# Account dim (written in §1b; broken reload here)
+acct_db, acct_old_to_new = _break_scd1_dim(acct_ss, "account_key", "account_id")
+acct_nk_to_db = {
+    r["account_id"]: acct_old_to_new.get(int(r["account_key"]), -1)
+    for _, r in acct_ss[acct_ss["account_key"] > 0].iterrows()
+}
 
 # ── Lookup dims (subscriber, market, account_type_scd2, …) ───────────────────
 lookup_golden = {}
@@ -449,7 +446,7 @@ ss_to_db_sk = {}
 
 for spec in LOOKUP_DIMS:
     tbl = spec["table"]
-    if tbl == "account_dim" and has_account:
+    if tbl == "account_dim":
         golden = acct_ss
         broken = acct_db
         old_to_new = acct_old_to_new
@@ -491,8 +488,7 @@ cust_key_to_id = dict(zip(
     cust_ss[cust_ss["customer_key"] > 0]["customer_id"],
 ))
 prod_key_to_code = dict(zip(prod_ss["product_key"], prod_ss["product_code"]))
-if has_account:
-    acct_key_to_id = dict(zip(acct_ss["account_key"], acct_ss["account_id"]))
+acct_key_to_id = dict(zip(acct_ss["account_key"], acct_ss["account_id"]))
 
 
 def _db_cust_sk(ss_key):
@@ -522,7 +518,7 @@ def _apply_cohorts(df, sk_cols, date_col, fk_resolvers=None):
                 out.at[idx, col] = _db_cust_sk(row[col])
             elif col == "product_key":
                 out.at[idx, col] = _db_prod_sk(row[col])
-            elif col == "account_key" and has_account:
+            elif col == "account_key":
                 aid = acct_key_to_id.get(int(row[col]))
                 out.at[idx, col] = acct_nk_to_db.get(aid, -1) if aid is not None else -1
     # Orphan injection: SS SK for dropped customers
@@ -546,8 +542,7 @@ def _apply_cohorts(df, sk_cols, date_col, fk_resolvers=None):
     return out
 
 
-tx_db = _apply_cohorts(tx_ss, ["customer_key", "product_key"] + (["account_key"] if has_account and "account_key" in tx_ss.columns else []),
-                       "transaction_date")
+tx_db = _apply_cohorts(tx_ss, ["customer_key", "product_key", "account_key"], "transaction_date")
 ret_db = _apply_cohorts(ret_ss, ["customer_key", "product_key"], "return_date")
 
 # SCD2 fact keeps SS surrogate_key (all INITIAL_SS — wrong after dim reload)
@@ -556,8 +551,6 @@ scd2_fact_db["load_batch"] = "INITIAL_SS"
 
 # SCD2 hub — all FK columns get mixed cohorts (each FK → different dim)
 hub_resolvers = {**ss_to_db_sk}
-if has_account and "account_key" not in hub_resolvers:
-    hub_resolvers["account_key"] = lambda sk: acct_nk_to_db.get(acct_key_to_id.get(int(sk)), -1)
 account_details_db = _apply_cohorts(
     account_details_ss, HUB_FK_COLS, "effectiveStartDate", fk_resolvers=hub_resolvers,
 )
@@ -582,6 +575,7 @@ SCENARIOS = [
     ("TC-REPAIR-SCD1-001", "SCD1 single fact", "customer_dim → transaction_fact", "surrogate_key_repair_notebook", "repair"),
     ("TC-REPAIR-SCD1-002", "SCD1 multiple facts", "customer_dim → transaction_fact + return_fact", "surrogate_key_repair_notebook", "repair"),
     ("TC-REPAIR-SCD1-003", "SCD1 composite NK", "product_dim → transaction_fact + return_fact", "surrogate_key_repair_notebook", "repair"),
+    ("TC-REPAIR-SCD1-004", "SCD1 third FK on fact", "account_dim → transaction_fact.account_key (+ hub)", "surrogate_key_repair_notebook", "repair"),
     ("TC-REPAIR-SCD2-001", "SCD2 dim current facts", "customer_scd2 → scd2_activity_fact (activity_cohort=CURRENT)", "surrogate_key_repair_notebook", "repair"),
     ("TC-REPAIR-SCD2-002", "SCD2 dim historic facts", "customer_scd2 → scd2_activity_fact (activity_cohort=HISTORIC)", "surrogate_key_repair_notebook", "repair"),
     ("TC-REPAIR-SCD2-003", "SCD2 AMBIGUOUS key-map", "customer_scd2 validity +15d → AMBIGUOUS rows", "surrogate_key_repair_notebook", "repair"),
@@ -614,7 +608,7 @@ print("=" * 72)
 for t in ["customer_dim", "product_dim", "customer_scd2", "transaction_fact",
           "return_fact", "scd2_activity_fact", "account_details_scd2",
           "subscriber_dim", "account_type_dim", "account_type_scd2", "market_dim", "autopay_dim",
-          "billing_product_dim", "payment_method_dim"] + (["account_dim"] if has_account else []):
+          "billing_product_dim", "payment_method_dim", "account_dim"]:
     fqn = f"{SRC}.{t}"
     print(f"  {fqn:55s}  {spark.table(fqn).count():>6,} rows")
 

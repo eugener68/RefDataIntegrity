@@ -391,10 +391,14 @@ Swap completed: [ ] Yes  Rollback tested: [ ] Yes
 ### Build synthetic data (practice before production)
 
 ```
-00_setup_trial.py  →  02_setup_bridge_test.py  →  [03 optional]
-  →  10_setup_sk_integrity_test_env.py (recreate=true)
+00_setup_trial.py  →  02_setup_bridge_test.py  →  10_setup_sk_integrity_test_env.py (recreate=true)
   →  11_run_sk_integrity_tests.py
 ```
+
+**On an existing recon workspace** (after `01`/`04`): run only **`10`** then **`11`**.  
+Notebook `10` overwrites `recon_src.sales.account_dim` and patches `transaction_fact.account_key`; it does **not** touch `recon_tgt.silver`.
+
+**Do not run `03`** for SK tests — that notebook is recon-only (ambiguous column aliases).
 
 | Catalog.schema | Role |
 |---|---|
