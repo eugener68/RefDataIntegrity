@@ -101,13 +101,23 @@ p = {name: dbutils.widgets.get(name).strip() for name in [
 legacy_nks = [c.strip() for c in p["legacy_nk_cols"].split(",") if c.strip()]
 new_nks    = [c.strip() for c in p["new_nk_cols"].split(",")    if c.strip()]
 
-# fact_tables format: "catalog.schema.table:fk_col, catalog.schema.table:fk_col"
+# fact_tables format: "catalog.schema.table:fk_col" or "table:fk1;fk2" (same dim, one rebuild)
 facts = []
 for entry in [e.strip() for e in p["fact_tables"].split(",") if e.strip()]:
-    table, _, fk = entry.partition(":")
-    if not fk:
-        raise ValueError(f"fact_tables entry '{entry}' must be 'table:fk_column'")
-    facts.append({"table": table.strip(), "fk": fk.strip()})
+    table, _, fk_part = entry.partition(":")
+    if not fk_part:
+        raise ValueError(f"fact_tables entry '{entry}' must be 'table:fk_column' or 'table:fk1;fk2'")
+    fk_cols = [c.strip() for c in fk_part.replace(";", ",").split(",") if c.strip()]
+    facts.append({"table": table.strip(), "fks": fk_cols})
+
+# Merge entries for the same table (one rebuild pass, multiple FK columns)
+_merged = {}
+for f in facts:
+    _merged.setdefault(f["table"], [])
+    for fk in f["fks"]:
+        if fk not in _merged[f["table"]]:
+            _merged[f["table"]].append(fk)
+facts = [{"table": t, "fks": fks} for t, fks in _merged.items()]
 
 event_date_cols = [c.strip() for c in p["fact_event_date_cols"].split(",") if c.strip()]
 
@@ -397,15 +407,16 @@ ORDER BY map_status
 """))
 
 # How much of each FACT is actually affected? (counts rows per status by FK)
-for i, f in enumerate(facts):
-    print(f"\nImpact on {f['table']} (FK: {f['fk']}):")
-    display(spark.sql(f"""
-    SELECT coalesce(km.map_status, 'NOT_IN_LEGACY_DIM') AS map_status,
-           COUNT(*) AS fact_rows
-    FROM {f['table']} fct
-    LEFT JOIN {keymap_fqn} km ON fct.{f['fk']} = km.old_sk
-    GROUP BY 1 ORDER BY 1
-    """))
+for f in facts:
+    for fk in f["fks"]:
+        print(f"\nImpact on {f['table']} (FK: {fk}):")
+        display(spark.sql(f"""
+        SELECT coalesce(km.map_status, 'NOT_IN_LEGACY_DIM') AS map_status,
+               COUNT(*) AS fact_rows
+        FROM {f['table']} fct
+        LEFT JOIN {keymap_fqn} km ON fct.{fk} = km.old_sk
+        GROUP BY 1 ORDER BY 1
+        """))
     # 'NOT_IN_LEGACY_DIM' rows carry an SK that never existed in the legacy dim.
     # Likely causes: that fact was ALSO reloaded after the dims (already has new
     # SKs — must be EXCLUDED from re-keying!), or the SK was already broken
@@ -432,50 +443,81 @@ if dry_run:
 else:
     for i, f in enumerate(facts):
         fixed_fqn = f"{f['table']}_fixed"
+        fks = f["fks"]
+        fk_list = ", ".join(fks)
+        ev = event_date_cols[i] if is_scd2 else None
 
-        if not is_scd2:
-            # SCD1: one old_sk maps to at most one new_sk (verified in step 2),
-            # so a plain LEFT JOIN on MATCHED rows is safe.
-            join_sql = f"""
+        if len(fks) == 1:
+            fk = fks[0]
+            if not is_scd2:
+                join_sql = f"""
             LEFT JOIN {keymap_fqn} km
-              ON fct.{f['fk']} = km.old_sk
+              ON fct.{fk} = km.old_sk
              AND km.map_status = 'MATCHED'
             """
-        else:
-            # SCD2: also constrain by the fact's event date so AMBIGUOUS legacy
-            # rows resolve to the correct version window. Rows whose event date
-            # falls in no window stay unmatched -> unknown member.
-            ev = event_date_cols[i]
-            join_sql = f"""
+                select_fk = f"coalesce(km.new_sk, {p['unknown_member_sk']}) AS {fk}"
+            else:
+                join_sql = f"""
             LEFT JOIN {keymap_fqn} km
-              ON  fct.{f['fk']} = km.old_sk
+              ON  fct.{fk} = km.old_sk
               AND km.map_status IN ('MATCHED', 'AMBIGUOUS')
               AND fct.{ev} >= km.valid_from
               AND fct.{ev} <  coalesce(km.valid_to, timestamp'9999-12-31')
             """
+                select_fk = f"coalesce(km.new_sk, {p['unknown_member_sk']}) AS {fk}"
+        else:
+            join_parts = []
+            select_parts = []
+            for j, fk in enumerate(fks):
+                alias = f"km{j}"
+                if not is_scd2:
+                    join_parts.append(f"""
+            LEFT JOIN {keymap_fqn} {alias}
+              ON fct.{fk} = {alias}.old_sk
+             AND {alias}.map_status = 'MATCHED'""")
+                else:
+                    join_parts.append(f"""
+            LEFT JOIN {keymap_fqn} {alias}
+              ON  fct.{fk} = {alias}.old_sk
+              AND {alias}.map_status IN ('MATCHED', 'AMBIGUOUS')
+              AND fct.{ev} >= {alias}.valid_from
+              AND fct.{ev} <  coalesce({alias}.valid_to, timestamp'9999-12-31')""")
+                select_parts.append(
+                    f"coalesce({alias}.new_sk, {p['unknown_member_sk']}) AS {fk}"
+                )
+            join_sql = "\n".join(join_parts)
+            select_fk = ",\n          ".join(select_parts)
 
-        spark.sql(f"""
+        if len(fks) == 1:
+            spark.sql(f"""
         CREATE OR REPLACE TABLE {fixed_fqn} AS
         SELECT
-          fct.* EXCEPT ({f['fk']}),
-          coalesce(km.new_sk, {p['unknown_member_sk']}) AS {f['fk']}
+          fct.* EXCEPT ({fk}),
+          {select_fk}
+        FROM {f['table']} fct
+        {join_sql}
+        """)
+        else:
+            spark.sql(f"""
+        CREATE OR REPLACE TABLE {fixed_fqn} AS
+        SELECT
+          fct.* EXCEPT ({fk_list}),
+          {select_fk}
         FROM {f['table']} fct
         {join_sql}
         """)
 
-        # --- Row-count invariant: a re-keying must NEVER change row counts. ---
-        # If it did, the SCD2 join matched multiple windows for one row
-        # (overlapping validity in the reloaded dim) — fix the dim, re-run.
         src_cnt = spark.table(f["table"]).count()
         fix_cnt = spark.table(fixed_fqn).count()
         status  = "✅" if src_cnt == fix_cnt else "❌ ROW COUNT CHANGED — DO NOT SWAP"
         print(f"{status}  {f['table']}: {src_cnt:,} rows -> {fixed_fqn}: {fix_cnt:,} rows")
 
-        unknown_cnt = spark.sql(f"""
-            SELECT COUNT(*) AS c FROM {fixed_fqn}
-            WHERE {f['fk']} = {p['unknown_member_sk']}
-        """).first()["c"]
-        print(f"    rows sent to unknown member ({p['unknown_member_sk']}): {unknown_cnt:,}")
+        for fk in fks:
+            unknown_cnt = spark.sql(f"""
+                SELECT COUNT(*) AS c FROM {fixed_fqn}
+                WHERE {fk} = {p['unknown_member_sk']}
+            """).first()["c"]
+            print(f"    {fk} → unknown member ({p['unknown_member_sk']}): {unknown_cnt:,}")
 
 # COMMAND ----------
 
@@ -494,15 +536,16 @@ else:
 if not dry_run:
     for f in facts:
         fixed_fqn = f"{f['table']}_fixed"
-        orphans = spark.sql(f"""
+        for fk in f["fks"]:
+            orphans = spark.sql(f"""
             SELECT COUNT(*) AS c
             FROM {fixed_fqn} fct
             LEFT ANTI JOIN {new_dim_fqn} d
-              ON fct.{f['fk']} = d.{p['new_sk_col']}
-            WHERE fct.{f['fk']} <> {p['unknown_member_sk']}
+              ON fct.{fk} = d.{p['new_sk_col']}
+            WHERE fct.{fk} <> {p['unknown_member_sk']}
         """).first()["c"]
-        flag = "✅" if orphans == 0 else "❌"
-        print(f"{flag} {fixed_fqn}: {orphans:,} orphaned FK rows against {new_dim_fqn}")
+            flag = "✅" if orphans == 0 else "❌"
+            print(f"{flag} {fixed_fqn}.{fk}: {orphans:,} orphaned FK rows against {new_dim_fqn}")
 else:
     print("DRY RUN — nothing to validate yet.")
 

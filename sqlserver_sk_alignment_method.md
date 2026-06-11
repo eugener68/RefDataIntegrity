@@ -4,7 +4,7 @@
 
 Companion documentation for `sqlserver_sk_alignment_notebook.py`
 
----
+> **Operators:** use **[RUNBOOK.md](RUNBOOK.md)** for step-by-step instructions. This document is the technical deep dive.
 
 ## 0. Choosing the Right Notebook
 
