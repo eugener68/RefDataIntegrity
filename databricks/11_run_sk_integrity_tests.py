@@ -1,17 +1,21 @@
 # Databricks notebook source
+# Run this cell first — parameter dropdowns appear at the top of the notebook.
+dbutils.widgets.dropdown("phase", "setup", ["setup", "post_repair"], "Test phase")
+dbutils.widgets.dropdown("fail_fast", "false", ["true", "false"], "Stop on first failure")
+
+# COMMAND ----------
+
 # MAGIC %md
 # MAGIC # SK Integrity — Automated Test Runner
 # MAGIC
 # MAGIC Validates synthetic test data and (optionally) post-repair state.
 # MAGIC
-# MAGIC **Prerequisites:** `00_setup_trial.py`, `02_setup_bridge_test.py`, `10_setup_sk_integrity_test_env.py`
+# MAGIC **Prerequisites:** `10_setup_sk_integrity_test_env.py` (`bootstrap=auto`, `recreate=true`)
 # MAGIC
 # MAGIC **Docs:** `SK_INTEGRITY_TEST_CASES.md`, `RUNBOOK.md`
-
-# COMMAND ----------
-
-dbutils.widgets.dropdown("phase", "setup", ["setup", "post_repair"], "Test phase")
-dbutils.widgets.dropdown("fail_fast", "false", ["true", "false"], "Stop on first failure")
+# MAGIC
+# MAGIC **Parameters:** use the **`phase`** and **`fail_fast`** dropdowns at the top of the notebook
+# MAGIC (created by the first code cell). Default: `phase=setup`.
 
 # COMMAND ----------
 

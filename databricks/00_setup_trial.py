@@ -15,7 +15,7 @@
 # ─── Prerequisites ────────────────────────────────────────────────────────────
 #  • Run on a cluster with DBR 13+ (Unity Catalog enabled)
 #  • Your user must be metastore admin OR have CREATE CATALOG privilege
-#    (trial accounts are typically granted this automatically)
+#  • Optional if you use 10_setup_sk_integrity_test_env.py (bootstrap=auto) for SK + recon base
 #  • No external packages needed — only pandas + pyspark (both pre-installed)
 # ──────────────────────────────────────────────────────────────────────────────
 

@@ -8,8 +8,9 @@ Companion to `10_setup_sk_integrity_test_env.py`. **Operators:** see [RUNBOOK.md
 
 ## Overview
 
-This setup **reuses the Recon Generator catalogs** already in your workspace. It does
-**not** replace `recon_tgt.silver` (hash-mismatch recon tests continue to work).
+This setup **reuses the Recon Generator catalogs** already in your workspace. It keeps
+**`recon_tgt.silver`** hash-mismatch recon tests working (refreshes `transaction_fact` to match
+canonical golden src; creates missing `product_dim` only).
 
 | Catalog.schema | Role |
 |---|---|
@@ -20,19 +21,19 @@ This setup **reuses the Recon Generator catalogs** already in your workspace. It
 
 ### Prerequisites
 
-Run these notebooks **first** (in order):
+**One notebook:** `10_setup_sk_integrity_test_env.py` — no separate setup chain required.
 
-| Notebook | Provides |
+| Widget | Default | Meaning |
+|---|---|---|
+| `bootstrap` | `auto` | Create missing base tables (00 + product bridge equivalent) |
+| `bootstrap` | `always` | Reset `recon_src.sales` + `recon_tgt.silver` base to canonical recon trial |
+| `recreate` | `true` | Drop and rebuild `recon_tgt.gold` (+ staging/keymap) |
+
+| Path | Run |
 |---|---|
-| `00_setup_trial.py` | `customer_dim`, `transaction_fact`, `customer_scd2` |
-| `02_setup_bridge_test.py` | `product_dim` |
-| `10_setup_sk_integrity_test_env.py` | Broken gold, `account_dim`, `account_key` on facts, hub, all SK scenarios |
-
-**SK path:** `00` → `02` → `10` → `11` — **no `03` required.**
-
-**Existing recon DB** (after `01`/`04`): run **`10`** + **`11`** only.
-
-**Recon + SK:** `00` → `01` → `02` → `04` → `10` → `11` — skip `03` unless testing recon table aliases.
+| **Existing recon DB** (after legacy `00`–`04`) | **`10`** → **`11`** |
+| **Empty workspace** | **`10`** → **`11`** |
+| **Recon-only trial** (no SK suite) | Optional `00_setup_trial.py` in this repo |
 
 ---
 
@@ -289,4 +290,4 @@ Re-run `10` with `recreate=true` to reset the broken baseline between test cycle
 
 - [Surrogate Key Repair method](../surrogate_key_repair_method.md)
 - [SQL Server SK Alignment method](../sqlserver_sk_alignment_method.md)
-- Recon setup: `00_setup_trial.py` … `04_setup_resolver_stress_test.py`
+- Recon-only trial: optional `00_setup_trial.py` (SK suite uses `10_setup_sk_integrity_test_env.py` bootstrap instead)

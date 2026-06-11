@@ -1,4 +1,13 @@
 # Databricks notebook source
+# Run this cell first — parameter dropdowns appear at the top of the notebook.
+dbutils.widgets.dropdown("recreate", "true", ["true", "false"], "Drop and recreate recon_tgt.gold (+ staging/keymap)")
+dbutils.widgets.dropdown(
+    "bootstrap", "auto", ["auto", "always", "never"],
+    "auto=create missing base; always=reset 00+product base; never=require base exists",
+)
+
+# COMMAND ----------
+
 # MAGIC %md
 # MAGIC # SK Integrity Test Environment — Setup (on Recon catalogs)
 # MAGIC
@@ -11,15 +20,19 @@
 # MAGIC | `recon_tgt.gold` | **Broken Databricks** — reloaded dims with wrong SKs + mixed-cohort facts |
 # MAGIC | `recon_tgt.staging` / `recon_tgt.keymap` | Repair notebook outputs |
 # MAGIC
-# MAGIC ### Prerequisites (run first)
-# MAGIC 1. `00_setup_trial.py` — customer_dim, transaction_fact, customer_scd2
-# MAGIC 2. `02_setup_bridge_test.py` — product_dim
+# MAGIC ### Two setup paths — same SK test end state
+# MAGIC | Path | When | What to run |
+# MAGIC |---|---|---|
+# MAGIC | **Existing recon DB** | Already ran `00`–`04` (or partial) | This notebook only (`bootstrap=auto`, `recreate=true`) |
+# MAGIC | **Empty / fresh DB** | New team, no catalogs yet | This notebook only (`bootstrap=auto`, `recreate=true`) |
 # MAGIC
-# MAGIC **Not required:** `03_setup_ambiguous_cols_test.py` (recon-only). This notebook creates
-# MAGIC `account_dim` + `transaction_fact.account_key` itself (TC-REPAIR-SCD1-004 third FK).
+# MAGIC **`bootstrap=auto`** (default): creates missing base tables (00 + product bridge equivalent).
+# MAGIC **`bootstrap=always`**: resets `recon_src.sales` + `recon_tgt.silver` base tables to the canonical
+# MAGIC recon trial state, then builds SK fixtures. Use to recover a known baseline.
 # MAGIC
-# MAGIC **Compatible with:** existing DB after `01`/`04` (recon) — overwrites `recon_src.sales.account_dim`
-# MAGIC and patches golden `transaction_fact`; does **not** touch `recon_tgt.silver`.
+# MAGIC **Recon coexistence:** refreshes `recon_tgt.silver.transaction_fact` to match canonical golden
+# MAGIC `transaction_fact` (hash-mismatch pattern). Other silver tables are left unchanged unless missing
+# MAGIC or `bootstrap=always`.
 # MAGIC
 # MAGIC ### Golden tables written/updated in `recon_src.sales`
 # MAGIC - `account_dim` — SK test fixture (120 rows, NK `account_id`)
@@ -49,33 +62,34 @@
 # MAGIC
 # MAGIC See `sk_integrity_test_guide.md` for repair notebook widget presets.
 # MAGIC See **`RUNBOOK.md`** for the unified team runbook.
-
-# COMMAND ----------
-
-dbutils.widgets.dropdown("recreate", "true", ["true", "false"], "Drop and recreate recon_tgt.gold (+ staging/keymap)")
+# MAGIC
+# MAGIC **Parameters:** use the **`recreate`** and **`bootstrap`** dropdowns at the top of the notebook
+# MAGIC (created by the first code cell). Defaults: `recreate=true`, `bootstrap=auto`.
 
 # COMMAND ----------
 
 RECREATE = dbutils.widgets.get("recreate") == "true"
+BOOTSTRAP = dbutils.widgets.get("bootstrap")
 
 SRC = "recon_src.sales"
 TGT = "recon_tgt.gold"
 STAGING = "recon_tgt.staging"
 KEYMAP = "recon_tgt.keymap"
+SILVER = "recon_tgt.silver"
 
-REQUIRED = [
-    f"{SRC}.customer_dim",
-    f"{SRC}.transaction_fact",
-    f"{SRC}.customer_scd2",
-    f"{SRC}.product_dim",
-]
 
-for tbl in REQUIRED:
+def _table_exists(full_table: str) -> bool:
     try:
-        n = spark.table(tbl).count()
-        print(f"  ✓ {tbl}  ({n:,} rows)")
-    except Exception as exc:
-        raise RuntimeError(f"Missing {tbl} — run 00_setup_trial.py and 02_setup_bridge_test.py first.\n{exc}")
+        spark.table(full_table).limit(1).collect()
+        return True
+    except Exception:
+        return False
+
+
+spark.sql("CREATE CATALOG IF NOT EXISTS recon_src COMMENT 'Simulates source catalog (Lakehouse Federation stand-in)'")
+spark.sql("CREATE CATALOG IF NOT EXISTS recon_tgt COMMENT 'Target Unity Catalog (native Delta)'")
+spark.sql("CREATE SCHEMA IF NOT EXISTS recon_src.sales   COMMENT 'Source sales schema'")
+spark.sql(f"CREATE SCHEMA IF NOT EXISTS {SILVER}  COMMENT 'Target silver schema (recon hash-mismatch)'")
 
 spark.sql("CREATE SCHEMA IF NOT EXISTS recon_tgt.gold")
 spark.sql("CREATE SCHEMA IF NOT EXISTS recon_tgt.staging")
@@ -119,6 +133,43 @@ def _to_date(val):
     return pd.Timestamp(val).date()
 
 
+def _normalize_scd2_df(df: pd.DataFrame, table_name: str = "SCD2 table") -> pd.DataFrame:
+    """Map legacy column names; derive recordStatus when missing."""
+    out = df.copy()
+    rename = {
+        "record_status": "recordStatus",
+        "RecordStatus": "recordStatus",
+        "effective_start_date": "effectiveStartDate",
+        "effective_end_date": "effectiveEndDate",
+        "EffectiveStartDate": "effectiveStartDate",
+        "EffectiveEndDate": "effectiveEndDate",
+        "valid_from": "effectiveStartDate",
+        "valid_to": "effectiveEndDate",
+        "is_current": "recordStatus",
+    }
+    out = out.rename(columns={k: v for k, v in rename.items() if k in out.columns})
+    if "recordStatus" in out.columns and out["recordStatus"].dtype != object:
+        out["recordStatus"] = out["recordStatus"].map({True: "C", False: "H", 1: "C", 0: "H"}).fillna(out["recordStatus"])
+    if "recordStatus" not in out.columns:
+        if "effectiveEndDate" in out.columns:
+            out["recordStatus"] = out["effectiveEndDate"].apply(
+                lambda d: "C" if _to_date(d) == date(2999, 12, 31) else "H"
+            )
+        else:
+            raise KeyError(
+                f"{table_name} missing recordStatus and effectiveEndDate — "
+                f"found columns: {list(out.columns)}. "
+                "Re-run with bootstrap=auto (default) or bootstrap=always."
+            )
+    for col in ("effectiveStartDate", "effectiveEndDate"):
+        if col not in out.columns:
+            raise KeyError(
+                f"{table_name} missing {col} — found columns: {list(out.columns)}. "
+                "Re-run with bootstrap=auto (default) or bootstrap=always."
+            )
+    return out
+
+
 def _lookup_dim(name, sk_col, nk_col, n, code_prefix):
     """Small SCD1 reference dim with unknown member."""
     codes = [f"{code_prefix}{str(i).zfill(4)}" for i in range(1, n + 1)]
@@ -136,16 +187,229 @@ print(f"Reference dates: D-1={D_MINUS_1}, today={TODAY}")
 # COMMAND ----------
 
 # MAGIC %md
+# MAGIC ## 0. Bootstrap base recon + SK golden tables (00 + product bridge equivalent)
+# MAGIC
+# MAGIC Deterministic **SEED=42** generators — same data whether you start from an empty workspace
+# MAGIC or an existing DB that already ran recon setup notebooks.
+
+# COMMAND ----------
+
+# ── Shared constants (mirrors 00_setup_trial.py + 02_setup_bridge_test.py) ────
+N_DIM = 1_000
+N_FACT = 1_000
+N_SCD2_CURRENT = 300
+N_SCD2_HIST = 700
+HASH_MISMATCH = 30
+N_PRODUCTS = 50
+PRODUCT_HASH_MISMATCH = 5
+
+_CITIES = ["New York", "Los Angeles", "Chicago", "Houston", "Phoenix",
+           "Philadelphia", "San Antonio", "San Diego", "Dallas", "San Jose"]
+_STATES = ["NY", "CA", "IL", "TX", "AZ", "PA", "TX", "CA", "TX", "CA"]
+_SEGMENTS = ["Bronze", "Silver", "Gold", "Platinum"]
+_CATEGORIES = ["Electronics", "Clothing", "Food & Beverage", "Home & Garden", "Sports"]
+_BRANDS = ["AlphaBrand", "BetaCo", "GammaTech", "DeltaWorks", "EpsilonGoods"]
+
+
+def _rand_dates(start: str, end: str, n: int):
+    s, e = date.fromisoformat(start), date.fromisoformat(end)
+    return [s + timedelta(days=int(d)) for d in _rng.integers(0, (e - s).days, n)]
+
+
+def _rand_timestamps(n: int):
+    base = datetime(2025, 1, 1)
+    offsets = [timedelta(seconds=int(s)) for s in _rng.integers(0, 86_400 * 365, n)]
+    return pd.to_datetime([base + o for o in offsets]).astype("datetime64[us]")
+
+
+def _dim_src() -> pd.DataFrame:
+    n = N_DIM
+    ci = _rng.integers(0, len(_CITIES), n)
+    return pd.DataFrame({
+        "customer_key":  np.arange(1, n + 1, dtype="int64"),
+        "customer_id":   np.arange(1, n + 1, dtype="int32"),
+        "customer_name": [f"Customer {i}" for i in range(1, n + 1)],
+        "email":         [f"customer{i}@example.com" for i in range(1, n + 1)],
+        "city":          [_CITIES[i] for i in ci],
+        "state_code":    [_STATES[i] for i in ci],
+        "segment":       [_SEGMENTS[i % len(_SEGMENTS)] for i in range(n)],
+        "created_date":  _rand_dates("2020-01-01", "2024-12-31", n),
+        "is_active":     [True] * n,
+    })
+
+
+def _dim_tgt_hash_mismatch(src: pd.DataFrame) -> pd.DataFrame:
+    tgt = src.copy()
+    tgt.loc[100:100 + HASH_MISMATCH - 1, "city"] = "Boston"
+    tgt.loc[100:100 + HASH_MISMATCH - 1, "segment"] = "Unknown"
+    return tgt
+
+
+def _fact_src() -> pd.DataFrame:
+    n = N_FACT
+    qty = _rng.integers(1, 21, n).astype("int32")
+    unit = np.round(_rng.uniform(5.0, 500.0, n), 2)
+    disc = np.round(_rng.uniform(0.0, 50.0, n), 2)
+    return pd.DataFrame({
+        "transaction_id":     np.arange(1, n + 1, dtype="int64"),
+        "customer_key":       _rng.integers(1, 201, n).astype("int64"),
+        "product_key":        _rng.integers(1, 51, n).astype("int32"),
+        "transaction_date":   _rand_dates("2024-01-01", "2024-12-31", n),
+        "transaction_amount": np.round(unit * qty - disc, 2),
+        "quantity":           qty,
+        "unit_price":         unit,
+        "discount_amount":    disc,
+        "net_amount":         np.round(unit * qty - disc, 2),
+        "load_ts":            _rand_timestamps(n),
+    })
+
+
+def _fact_tgt_hash_mismatch(src: pd.DataFrame) -> pd.DataFrame:
+    tgt = src.copy()
+    tgt.loc[200:200 + HASH_MISMATCH - 1, "transaction_amount"] = 0.01
+    tgt.loc[200:200 + HASH_MISMATCH - 1, "net_amount"] = 0.01
+    return tgt
+
+
+def _scd2_src(seed: int = SEED + 2) -> pd.DataFrame:
+    """Deterministic SCD2 fixture — fixed sub-seed so bootstrap path order does not matter."""
+    rng = np.random.default_rng(seed)
+    nc, nh = N_SCD2_CURRENT, N_SCD2_HIST
+
+    def _scd2_timestamps(n: int):
+        base = datetime(2025, 1, 1)
+        offsets = [timedelta(seconds=int(s)) for s in rng.integers(0, 86_400 * 365, n)]
+        return pd.to_datetime([base + o for o in offsets]).astype("datetime64[us]")
+
+    ci_c = rng.integers(0, len(_CITIES), nc)
+    current = pd.DataFrame({
+        "surrogate_key":  np.arange(1, nc + 1, dtype="int64"),
+        "customer_id":    np.arange(1, nc + 1, dtype="int32"),
+        "customer_name":  [f"Customer {i}" for i in range(1, nc + 1)],
+        "email":          [f"customer{i}@example.com" for i in range(1, nc + 1)],
+        "city":           [_CITIES[i] for i in ci_c],
+        "state_code":     [_STATES[i] for i in ci_c],
+        "segment":        [_SEGMENTS[i % len(_SEGMENTS)] for i in range(nc)],
+        "recordStatus":       ["C"] * nc,
+        "effectiveStartDate": [date(2024, 1, 1)] * nc,
+        "effectiveEndDate":   [date(2999, 12, 31)] * nc,
+        "load_ts":        _scd2_timestamps(nc),
+    })
+    ci_h = rng.integers(0, len(_CITIES), nh)
+    cids = rng.integers(1, nc + 1, nh).astype("int32")
+    historical = pd.DataFrame({
+        "surrogate_key":  np.arange(nc + 1, nc + nh + 1, dtype="int64"),
+        "customer_id":    cids,
+        "customer_name":  [f"Customer {i}" for i in cids],
+        "email":          [f"customer{i}.old@example.com" for i in cids],
+        "city":           [_CITIES[i] for i in ci_h],
+        "state_code":     [_STATES[i] for i in ci_h],
+        "segment":        [_SEGMENTS[i % len(_SEGMENTS)] for i in range(nh)],
+        "recordStatus":       ["H"] * nh,
+        "effectiveStartDate": [date(2022, 1, 1)] * nh,
+        "effectiveEndDate":   [date(2023, 12, 31)] * nh,
+        "load_ts":        _scd2_timestamps(nh),
+    })
+    return pd.concat([current, historical], ignore_index=True)
+
+
+def _scd2_tgt_hash_mismatch(src: pd.DataFrame) -> pd.DataFrame:
+    tgt = _normalize_scd2_df(src.copy(), "customer_scd2")
+    curr_idx = tgt.index[tgt["recordStatus"] == "C"][:HASH_MISMATCH]
+    tgt.loc[curr_idx, "city"] = "Boston"
+    tgt.loc[curr_idx, "segment"] = "Unknown"
+    return tgt
+
+
+def _product_src() -> pd.DataFrame:
+    n = N_PRODUCTS
+    cats = [_CATEGORIES[i % len(_CATEGORIES)] for i in range(n)]
+    brands = [_BRANDS[i % len(_BRANDS)] for i in range(n)]
+    return pd.DataFrame({
+        "product_key":  np.arange(1, n + 1, dtype="int32"),
+        "product_code": [f"PRD-{str(i).zfill(3)}" for i in range(1, n + 1)],
+        "product_name": [f"Product {chr(65 + (i % 26))}{i}" for i in range(1, n + 1)],
+        "category":     cats,
+        "brand":        brands,
+        "unit_cost":    np.round(_rng.uniform(5.0, 250.0, n), 2),
+        "is_active":    [True] * n,
+    })
+
+
+def _product_tgt_hash_mismatch(src: pd.DataFrame) -> pd.DataFrame:
+    tgt = src.copy()
+    tgt.loc[10:10 + PRODUCT_HASH_MISMATCH - 1, "category"] = "Uncategorised"
+    tgt.loc[10:10 + PRODUCT_HASH_MISMATCH - 1, "brand"] = "UnknownBrand"
+    return tgt
+
+
+BASE_TABLES = [
+    f"{SRC}.customer_dim",
+    f"{SRC}.customer_scd2",
+]
+
+need_bootstrap = BOOTSTRAP == "always" or (
+    BOOTSTRAP == "auto" and not _table_exists(f"{SRC}.customer_dim")
+)
+if BOOTSTRAP == "never":
+    missing = [t for t in BASE_TABLES if not _table_exists(t)]
+    if missing:
+        raise RuntimeError(
+            f"bootstrap=never but missing base tables: {missing}. "
+            "Use bootstrap=auto (default) or run 00_setup_trial.py first."
+        )
+    print("bootstrap=never — using existing base tables.")
+elif need_bootstrap:
+    print(f"Bootstrapping base recon tables (bootstrap={BOOTSTRAP})…")
+    dim_src = _dim_src()
+    scd2_src = _scd2_src()
+    prod_base = _product_src()
+    prod_src = prod_base.copy()
+    prod_src["source_system"] = "ERP"
+
+    _write(dim_src, f"{SRC}.customer_dim")
+    _write(scd2_src, f"{SRC}.customer_scd2")
+    _write(prod_src, f"{SRC}.product_dim")
+
+    _write(_dim_tgt_hash_mismatch(dim_src), f"{SILVER}.customer_dim")
+    _write(_scd2_tgt_hash_mismatch(scd2_src), f"{SILVER}.customer_scd2")
+    _write(_product_tgt_hash_mismatch(prod_base), f"{SILVER}.product_dim")
+    print("Base recon + silver hash-mismatch tables ready (transaction_fact → §1b).")
+else:
+    print("bootstrap=auto — base tables exist.")
+
+if not need_bootstrap:
+    prod_base = _product_src()
+    prod_src = prod_base.copy()
+    prod_src["source_system"] = "ERP"
+    _write(prod_src, f"{SRC}.product_dim")
+    if not _table_exists(f"{SILVER}.product_dim"):
+        _write(_product_tgt_hash_mismatch(prod_base), f"{SILVER}.product_dim")
+        print(f"  Created missing {SILVER}.product_dim for recon bridge tests.")
+    else:
+        print("  Refreshed SK-canonical recon_src.sales.product_dim (source_system=ERP).")
+
+# SK-canonical customer_scd2 — every run (org-standard columns incl. recordStatus)
+scd2_canonical = _scd2_src()
+_write(scd2_canonical, f"{SRC}.customer_scd2")
+print("  Refreshed SK-canonical recon_src.sales.customer_scd2 (recordStatus, effective*Date).")
+
+# COMMAND ----------
+
+# MAGIC %md
 # MAGIC ## 1. Load golden dimensions from `recon_src.sales`
 
 # COMMAND ----------
 
 cust_ss = spark.table(f"{SRC}.customer_dim").toPandas()
 prod_ss = spark.table(f"{SRC}.product_dim").toPandas()
-scd2_ss = spark.table(f"{SRC}.customer_scd2").toPandas()
+scd2_ss = _normalize_scd2_df(
+    spark.table(f"{SRC}.customer_scd2").toPandas(),
+    f"{SRC}.customer_scd2",
+)
 
-# Add source_system for composite-NK product tests (constant on all rows)
-prod_ss["source_system"] = "ERP"
+if "source_system" not in prod_ss.columns:
+    prod_ss["source_system"] = "ERP"
 
 # Unknown member rows (SK = -1) if missing
 if (cust_ss["customer_key"] >= 0).all():
@@ -162,8 +426,8 @@ print(f"Golden dims: customer={len(cust_ss):,}, product={len(prod_ss):,}, scd2={
 # MAGIC %md
 # MAGIC ## 1b. Golden `account_dim` + third FK on `transaction_fact`
 # MAGIC
-# MAGIC Replaces any `account_dim` from recon notebooks `01`/`03` in **`recon_src` only**.
-# MAGIC Adds `account_key` to golden `transaction_fact` (replaces 03 for SK tests).
+# MAGIC SK-canonical `account_dim` in **`recon_src` only**. Ensures `transaction_fact` has
+# MAGIC `customer_key`, `product_key`, and `account_key` on the canonical 1 000-row grain.
 
 # COMMAND ----------
 
@@ -171,10 +435,13 @@ acct_ss = _lookup_dim("account", "account_key", "account_id", N_ACCOUNTS, "AID")
 _write(acct_ss, f"{SRC}.account_dim")
 valid_acct_keys = acct_ss[acct_ss["account_key"] > 0]["account_key"].values
 
-tx_ss = spark.table(f"{SRC}.transaction_fact").toPandas()
+# Canonical transaction_fact (SEED=42) — identical SK gold whether bootstrap ran or not
+tx_ss = _fact_src()
 tx_ss["account_key"] = _rng.choice(valid_acct_keys, size=len(tx_ss)).astype("int64")
 _write(tx_ss, f"{SRC}.transaction_fact")
-print(f"transaction_fact: added account_key (third FK), {len(tx_ss):,} rows")
+# Keep silver transaction_fact aligned with canonical src (recon hash-mismatch scenario)
+_write(_fact_tgt_hash_mismatch(tx_ss.drop(columns=["account_key"])), f"{SILVER}.transaction_fact")
+print(f"transaction_fact: canonical grain + account_key (third FK), {len(tx_ss):,} rows")
 n_tx = len(tx_ss)
 n_ret = max(200, n_tx // 5)
 ret_ss = pd.DataFrame({
@@ -393,7 +660,11 @@ reload_cust = active_cust[~active_cust["customer_id"].isin(orphan_old_ids)].sort
 reload_cust["customer_key"] = np.arange(1, len(reload_cust) + 1)
 
 extra_cust = pd.DataFrame({
-    "customer_key":  np.arange(len(reload_cust) + 1, len(reload_cust) + ORPHAN_NEW_COUNT + 1),
+    # High SK range — do not recycle dropped customers' golden keys (971–1000)
+    "customer_key":  np.arange(
+        int(active_cust["customer_key"].max()) + 100,
+        int(active_cust["customer_key"].max()) + 100 + ORPHAN_NEW_COUNT,
+    ),
     "customer_id":   np.arange(active_cust["customer_id"].max() + 1,
                                active_cust["customer_id"].max() + ORPHAN_NEW_COUNT + 1),
     "customer_name": [f"New Customer {i}" for i in range(1, ORPHAN_NEW_COUNT + 1)],
@@ -490,6 +761,21 @@ cust_key_to_id = dict(zip(
 prod_key_to_code = dict(zip(prod_ss["product_key"], prod_ss["product_code"]))
 acct_key_to_id = dict(zip(acct_ss["account_key"], acct_ss["account_id"]))
 
+broken_cust_keys = set(cust_db[cust_db["customer_key"] > 0]["customer_key"].astype(int))
+orphan_cust_keys = [
+    int(k) for k in cust_ss[cust_ss["customer_id"].isin(orphan_old_ids)]["customer_key"]
+    if int(k) not in broken_cust_keys
+]
+if len(orphan_cust_keys) < 10:
+    base = max(broken_cust_keys, default=0) + 1000
+    orphan_cust_keys.extend(range(base, base + 20))
+
+broken_acct_keys = set(acct_db[acct_db["account_key"] > 0]["account_key"].astype(int))
+orphan_acct_keys = list(range(max(broken_acct_keys, default=0) + 1000, max(broken_acct_keys, default=0) + 1020))
+
+broken_market_keys = set(lookup_broken["market_dim"][lookup_broken["market_dim"]["market_key"] > 0]["market_key"].astype(int))
+orphan_market_keys = list(range(max(broken_market_keys, default=0) + 1000, max(broken_market_keys, default=0) + 1020))
+
 
 def _db_cust_sk(ss_key):
     cid = cust_key_to_id.get(int(ss_key))
@@ -501,9 +787,10 @@ def _db_prod_sk(ss_key):
     return prod_nk_to_db.get((code, "ERP"), -1) if code else -1
 
 
-def _apply_cohorts(df, sk_cols, date_col, fk_resolvers=None):
+def _apply_cohorts(df, sk_cols, date_col, fk_resolvers=None, orphan_keys_by_col=None):
     """Apply mixed INITIAL_SS / DB_INCREMENTAL SK cohorts. fk_resolvers maps col → fn(ss_key)."""
     fk_resolvers = fk_resolvers or {}
+    orphan_keys_by_col = orphan_keys_by_col or {}
     out = df.copy()
     out["load_batch"] = "INITIAL_SS"
     incr = _rng.choice(len(out), size=int(len(out) * INCREMENTAL_PCT), replace=False)
@@ -521,12 +808,13 @@ def _apply_cohorts(df, sk_cols, date_col, fk_resolvers=None):
             elif col == "account_key":
                 aid = acct_key_to_id.get(int(row[col]))
                 out.at[idx, col] = acct_nk_to_db.get(aid, -1) if aid is not None else -1
-    # Orphan injection: SS SK for dropped customers
-    orphan_keys = cust_ss[cust_ss["customer_id"].isin(orphan_old_ids)]["customer_key"].tolist()
-    if orphan_keys and "customer_key" in sk_cols:
+    # Orphan injection: SK values that do not exist in broken dims (true pre-repair orphans)
+    for col, orphan_keys in orphan_keys_by_col.items():
+        if col not in sk_cols or not orphan_keys:
+            continue
         oidx = _rng.choice(len(out), size=min(20, len(out)), replace=False)
         for i, idx in enumerate(oidx[:10]):
-            out.at[idx, "customer_key"] = orphan_keys[i % len(orphan_keys)]
+            out.at[idx, col] = orphan_keys[i % len(orphan_keys)]
             out.at[idx, "load_batch"] = "INITIAL_SS_ORPHAN"
     if "customer_key" in out.columns and "customer_id" not in out.columns:
         out["customer_id"] = out["customer_key"].map(cust_key_to_id)
@@ -542,8 +830,14 @@ def _apply_cohorts(df, sk_cols, date_col, fk_resolvers=None):
     return out
 
 
-tx_db = _apply_cohorts(tx_ss, ["customer_key", "product_key", "account_key"], "transaction_date")
-ret_db = _apply_cohorts(ret_ss, ["customer_key", "product_key"], "return_date")
+tx_db = _apply_cohorts(
+    tx_ss, ["customer_key", "product_key", "account_key"], "transaction_date",
+    orphan_keys_by_col={"customer_key": orphan_cust_keys, "account_key": orphan_acct_keys},
+)
+ret_db = _apply_cohorts(
+    ret_ss, ["customer_key", "product_key"], "return_date",
+    orphan_keys_by_col={"customer_key": orphan_cust_keys},
+)
 
 # SCD2 fact keeps SS surrogate_key (all INITIAL_SS — wrong after dim reload)
 scd2_fact_db = scd2_fact_ss.copy()
@@ -553,6 +847,7 @@ scd2_fact_db["load_batch"] = "INITIAL_SS"
 hub_resolvers = {**ss_to_db_sk}
 account_details_db = _apply_cohorts(
     account_details_ss, HUB_FK_COLS, "effectiveStartDate", fk_resolvers=hub_resolvers,
+    orphan_keys_by_col={"market_key": orphan_market_keys},
 )
 
 _write(tx_db,              f"{TGT}.transaction_fact")

@@ -10,11 +10,10 @@ This document defines **automated and manual test cases** for the surrogate-key 
 
 | Step | Action |
 |---|---|
-| 1 | Run **`00_setup_trial.py`**, **`02_setup_bridge_test.py`**, then **`10_setup_sk_integrity_test_env.py`** (`recreate=true`) |
-| 2 | Run `10_setup_sk_integrity_test_env.py` with `recreate=true` |
-| 3 | Run `11_run_sk_integrity_tests.py` — validates setup (Phase 1) |
-| 4 | Run repair/alignment notebooks per case (Phase 2 — manual or job) |
-| 5 | Re-run `11_run_sk_integrity_tests.py` with `phase=post_repair` after swaps (Phase 3) |
+| 1 | Run **`10_setup_sk_integrity_test_env.py`** (`bootstrap=auto`, `recreate=true`) |
+| 2 | Run `11_run_sk_integrity_tests.py` — validates setup (Phase 1) |
+| 3 | Run repair/alignment notebooks per case (Phase 2 — manual or job) |
+| 4 | Re-run `11_run_sk_integrity_tests.py` with `phase=post_repair` after swaps (Phase 3) |
 
 Scenario registry table: `recon_tgt.gold.sk_test_scenario_manifest`
 

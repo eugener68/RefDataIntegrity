@@ -390,15 +390,21 @@ Swap completed: [ ] Yes  Rollback tested: [ ] Yes
 
 ### Build synthetic data (practice before production)
 
-```
-00_setup_trial.py  →  02_setup_bridge_test.py  →  10_setup_sk_integrity_test_env.py (recreate=true)
-  →  11_run_sk_integrity_tests.py
-```
+**Single entry point:** `10_setup_sk_integrity_test_env.py` (`bootstrap=auto`, `recreate=true`) → `11_run_sk_integrity_tests.py`
 
-**On an existing recon workspace** (after `01`/`04`): run only **`10`** then **`11`**.  
-Notebook `10` overwrites `recon_src.sales.account_dim` and patches `transaction_fact.account_key`; it does **not** touch `recon_tgt.silver`.
+**Per-SK RI report (pre/post repair):** `12_sk_integrity_report.py` — `report_mode=pre_repair` before repair, `post_repair` after `*_fixed` tables exist, `compare` for both.
 
-**Do not run `03`** for SK tests — that notebook is recon-only (ambiguous column aliases).
+| Path | When | Command |
+|---|---|---|
+| **Existing recon DB** | Already ran `00`–`04` (or partial recon setup) | Run **`10`** then **`11`** only |
+| **Empty / fresh workspace** | New team, no catalogs | Run **`10`** then **`11`** only (`bootstrap=auto` creates base tables) |
+| **Reset recon base** | Need canonical 00+product silver again | **`10`** with `bootstrap=always` |
+
+Notebook **`10`** bootstraps missing base tables (equivalent to legacy `00` + product bridge), writes SK-canonical
+golden dims in `recon_src.sales`, and builds broken state in `recon_tgt.gold`. It does **not** modify existing
+`recon_tgt.silver` unless tables are missing or `bootstrap=always`.
+
+Optional: `00_setup_trial.py` remains for Recon Generator trials without running the full SK suite.
 
 | Catalog.schema | Role |
 |---|---|
@@ -413,6 +419,7 @@ Notebook `10` overwrites `recon_src.sales.account_dim` and patches `transaction_
 | [databricks/SK_INTEGRITY_TEST_CASES.md](databricks/SK_INTEGRITY_TEST_CASES.md) | Detailed test case catalog |
 | [databricks/sk_integrity_test_guide.md](databricks/sk_integrity_test_guide.md) | Widget presets per scenario |
 | [databricks/11_run_sk_integrity_tests.py](databricks/11_run_sk_integrity_tests.py) | Automated setup validation |
+| [databricks/12_sk_integrity_report.py](databricks/12_sk_integrity_report.py) | Pre/post repair per-SK RI report |
 
 ---
 

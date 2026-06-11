@@ -54,16 +54,19 @@ databricks/
 
 ## Test environment (synthetic)
 
-Built on the **Recon Generator catalogs** (`recon_src` / `recon_tgt`) already in your workspace:
+Built on the **Recon Generator catalogs** (`recon_src` / `recon_tgt`):
 
 | Notebook | Purpose |
 |---|---|
-| `databricks/00_setup_trial.py` … `04_setup_resolver_stress_test.py` | Recon Generator base data (`recon_src.sales`, `recon_tgt.silver`) |
-| [`databricks/10_setup_sk_integrity_test_env.py`](databricks/10_setup_sk_integrity_test_env.py) | All scenarios: multi-fact, SCD2, hub, SCD2 lookup |
+| [`databricks/10_setup_sk_integrity_test_env.py`](databricks/10_setup_sk_integrity_test_env.py) | **Single entry point** — bootstraps base if needed, all SK scenarios |
 | [`databricks/11_run_sk_integrity_tests.py`](databricks/11_run_sk_integrity_tests.py) | Automated setup/post-repair tests |
+| [`databricks/12_sk_integrity_report.py`](databricks/12_sk_integrity_report.py) | Pre/post repair RI report per SK |
+| [`databricks/00_setup_trial.py`](databricks/00_setup_trial.py) | Optional — Recon Generator trial only (no SK suite) |
 | [`databricks/SK_INTEGRITY_TEST_CASES.md`](databricks/SK_INTEGRITY_TEST_CASES.md) | Detailed test case definitions |
 | [`databricks/sk_integrity_test_guide.md`](databricks/sk_integrity_test_guide.md) | Widget presets |
 | [`RUNBOOK.md`](RUNBOOK.md) | Operator runbook |
+
+**Two paths, same SK end state:** run **`10`** (`bootstrap=auto`, `recreate=true`) → **`11`** whether your workspace is empty or already has recon data from legacy setup notebooks.
 
 **Scenarios in synthetic data:** SCD1 single/multi-fact, composite NK, SCD2 facts (current + historic), SCD2 hub multi-FK, hub → SCD2 lookup (`account_type_scd2`), mixed cohorts, orphans, silent corruption.
 
